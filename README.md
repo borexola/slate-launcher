@@ -21,34 +21,34 @@ to illustrate the row; they are not part of Slate. The entries were published by
 
 ## Install
 
-Slate is installed from a computer over ADB; there is no store listing and no ready-made APK,
-so you build it once. The steps below take about ten minutes.
+Slate is installed from a computer over ADB; there is no store listing. The steps below take a
+few minutes and need no build.
 
 **You need**
 
-- A computer on the same network as the TV, with `bash` (Linux, macOS, or WSL on Windows).
+- A computer on the same network as the TV, with `bash`, `git` and `curl` (Linux, macOS, or WSL
+  on Windows).
 - `adb`, from the [Android platform-tools](https://developer.android.com/tools/releases/platform-tools).
-- JDK 17 and the Android SDK (platform 35), with `ANDROID_HOME` pointing at the SDK.
 
 **Steps**
 
-1. Get the code and build the app:
+1. Get the script:
 
    ```bash
    git clone https://github.com/borexola/slate-launcher.git
    cd slate-launcher
-   ./gradlew assembleRelease
    ```
 
 2. On the TV, switch on debugging: Settings > System > About, press "Android TV OS build" seven
    times, then turn on network (or USB) debugging under Developer options. Note the TV's IP
    address (Settings > Network & Internet).
 
-3. Connect and install. The TV asks you to allow the computer the first time.
+3. Connect, then download and install the latest release. The TV asks you to allow the computer
+   the first time.
 
    ```bash
    scripts/slate.sh connect <tv-ip>
-   scripts/slate.sh install
+   scripts/slate.sh update
    ```
 
 4. Make Slate the home screen. Have the TV on and awake for this.
@@ -59,12 +59,34 @@ so you build it once. The steps below take about ten minutes.
 
 5. Press Home on the remote. Slate opens; **Customise** in the top bar has every setting.
 
-To update later, pull the code, build again and run `scripts/slate.sh install`; settings are
-kept. To go back to the stock home screen run `scripts/slate.sh restore`, and to remove Slate
+To go back to the stock home screen run `scripts/slate.sh restore`, and to remove Slate
 `scripts/slate.sh uninstall` (see [Getting out again](#getting-out-again)).
 
 Shield, wireless-debugging-only devices and TVs with a manufacturer's home screen are covered
 under [Install in detail](#install-in-detail).
+
+### Updates
+
+New versions are published as [releases](https://github.com/borexola/slate-launcher/releases).
+To hear about them, use **Watch > Custom > Releases** on the repository page; GitHub then
+e-mails you each time one comes out.
+
+```bash
+git pull                    # the script itself
+scripts/slate.sh update     # the app on the TV; settings are kept
+```
+
+`update` downloads the latest release over https, checks it against the checksum published with
+it, and installs it. It says so and does nothing when the TV already has the latest version.
+Android itself only accepts an update signed with the same key as the Slate already installed,
+so a copy you built yourself cannot be updated this way (and the other way round): `update`
+tells you if that is the case and changes nothing.
+
+### Building it yourself
+
+Instead of step 3's `update`, build the app (see [Build](#build)) and run
+`scripts/slate.sh install`, which installs the copy built on this computer. Keep to one of the
+two ways on a given TV, because of the signing key.
 
 ## Build
 

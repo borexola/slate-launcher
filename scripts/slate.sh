@@ -21,6 +21,10 @@ SAVER_RECORD="/data/local/tmp/slate-screensaver-previous"
 MAX_PHOTO_BYTES=$((16 * 1024 * 1024))
 ADB=${ADB:-adb}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Where released builds are published (for `update`). A fork can point this at its own.
+RELEASES="${SLATE_RELEASES:-https://github.com/borexola/slate-launcher/releases}"
+RELEASE_APK=slate.apk
+MAX_APK_BYTES=$((50 * 1024 * 1024))
 
 # Stock home screens that may be switched off once Slate is in place. Order matters: the setup
 # helper goes first, so that the real launcher is the last thing standing if anything fails.
@@ -36,7 +40,9 @@ usage() {
 Usage: scripts/slate.sh <command>
 
   connect <tv-ip>[:port] connect to the TV (enable network debugging on it first)
-  install                install or update Slate
+  install                install or update Slate from the copy built on this computer
+  update                 download the latest released Slate and install it (no build needed;
+                         also does a first install)
   takeover               make Slate the home screen (switches the stock one off)
   restore                undo takeover: stock home screen back on, guard off, screensaver
                          back to the one used before screensaver-on
@@ -66,6 +72,42 @@ EOF
 die() {
   echo "slate: $*" >&2
   exit 1
+}
+
+# Downloads one address into a file. Only https, also after a redirect, and nothing larger than
+# an APK could be.
+fetch() {
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --max-filesize "$MAX_APK_BYTES" --connect-timeout 20 --max-time 300 --retry 2 -o "$2" "$1"
+}
+
+# Prints the version of the latest release, e.g. 0.5.1. GitHub answers ".../releases/latest"
+# with a redirect to ".../releases/tag/v<version>", so nothing has to be parsed.
+latest_version() {
+  local to
+  to="$(curl --proto '=https' --tlsv1.2 -fsS -o /dev/null -w '%{redirect_url}' \
+    --connect-timeout 20 --max-time 60 "$RELEASES/latest")" || return 1
+  case "$to" in */releases/tag/v*) ;; *) return 1 ;; esac
+  to="${to##*/releases/tag/v}"
+  case "$to" in ''|*[!0-9A-Za-z.]*) return 1 ;; esac
+  printf '%s\n' "$to"
+}
+
+# Prints the version of the Slate on the TV, or nothing if that cannot be read.
+installed_version() {
+  dev dumpsys package "$PKG" | LC_ALL=C tr -d '\r' |
+    sed -n 's/^ *versionName=\([0-9A-Za-z.]*\)$/\1/p' | head -n 1
+}
+
+# Prints a file's SHA-256 in hex.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    die "update needs sha256sum or shasum on this computer, to check the download."
+  fi
 }
 
 # Quotes one argument for the TV's shell. adb joins its arguments with spaces and the TV parses
@@ -1103,6 +1145,57 @@ case "$action" in
     fi
     # Pre-compile so the home screen starts quickly. Not essential, so failure is ignored.
     dev cmd package compile -m speed -f "$PKG" >/dev/null 2>&1 || true
+    ;;
+
+  update)
+    require_device
+    command -v curl >/dev/null 2>&1 || die "update needs curl on this computer."
+    latest="$(latest_version)" || die "could not find the latest release at
+  $RELEASES
+  (no connection, or nothing has been published there yet)."
+    current=""
+    if has "$PKG"; then current="$(installed_version)"; fi
+    if [ -n "$current" ] && [ "$current" = "$latest" ]; then
+      echo "Slate $current is the latest release. Nothing to do."
+      exit 0
+    fi
+
+    tmp="$(mktemp -d)" || die "could not make a folder for the download."
+    trap 'rm -rf -- "$tmp"' EXIT
+    echo "Downloading Slate $latest..."
+    fetch "$RELEASES/download/v$latest/$RELEASE_APK" "$tmp/$RELEASE_APK" ||
+      die "could not download Slate $latest. Nothing was changed."
+    fetch "$RELEASES/download/v$latest/$RELEASE_APK.sha256" "$tmp/$RELEASE_APK.sha256" ||
+      die "could not download the checksum of Slate $latest. Nothing was changed."
+    want="$(LC_ALL=C sed -n '1s/^\([0-9a-f]\{64\}\)\([^0-9a-f].*\)\{0,1\}$/\1/p' "$tmp/$RELEASE_APK.sha256")"
+    got="$(sha256_of "$tmp/$RELEASE_APK")"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+      die "the download does not match its published checksum. Nothing was installed."
+    fi
+
+    if out="$("$ADB" install -r "$tmp/$RELEASE_APK" 2>&1)"; then
+      show "$out"
+    else
+      show "$out" >&2
+      case "$out" in
+        *INSTALL_FAILED_UPDATE_INCOMPATIBLE*|*"signatures do not match"*)
+          die "the Slate on the TV was signed with a different key than the released one (a copy you
+  built yourself?), and Android does not update across keys. Nothing was changed. Either keep
+  updating it your way (build, then scripts/slate.sh install), or copy your settings off the TV
+  (pull-config), remove Slate (scripts/slate.sh uninstall) and run update again." ;;
+        *INSTALL_FAILED_VERSION_DOWNGRADE*)
+          die "the Slate on the TV (${current:-unknown version}) is newer than the latest release ($latest).
+  Nothing was changed." ;;
+      esac
+      die "Slate could not be installed (see above)."
+    fi
+    # Pre-compile so the home screen starts quickly. Not essential, so failure is ignored.
+    dev cmd package compile -m speed -f "$PKG" >/dev/null 2>&1 || true
+    if [ -n "$current" ]; then
+      echo "Slate $latest is installed (was $current). Settings are kept."
+    else
+      echo "Slate $latest is installed. Next: scripts/slate.sh takeover"
+    fi
     ;;
 
   takeover)
