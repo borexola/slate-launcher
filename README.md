@@ -51,6 +51,10 @@ few minutes and need no build.
    scripts/slate.sh update
    ```
 
+   With more than one device attached (a second TV, an emulator), every command says which one
+   it is using. Choose with `export ANDROID_SERIAL=<tv-ip>:5555`; `connect` reminds you when
+   the terminal is still pointed at another device.
+
 4. Make Slate the home screen. Have the TV on and awake for this.
 
    ```bash

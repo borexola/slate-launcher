@@ -146,12 +146,43 @@ dev_script() {
   "$ADB" shell "$script" </dev/null
 }
 
+# Prints the devices adb can use right now, one serial per line.
+attached() {
+  "$ADB" devices 2>/dev/null | LC_ALL=C tr -d '\r' |
+    awk -F'\t' 'NR > 1 && $2 == "device" { print $1 }' | LC_ALL=C tr -cd '[:print:]\n'
+}
+
+TOLD_DEVICE=0
 require_device() {
-  local state
+  local state all count serial model
   state="$("$ADB" get-state 2>/dev/null || true)"
-  [ "$state" = device ] || die "no TV reachable over ADB (state: ${state:-none}).
+  all="$(attached)"
+  count="$(printf '%s\n' "$all" | grep -c . || true)"
+  if [ "$state" != device ]; then
+    if [ -z "${ANDROID_SERIAL:-}" ] && [ "$count" -gt 1 ]; then
+      die "several devices are attached, so say which one is meant. Attached:
+$(printf '%s\n' "$all" | sed 's/^/    /')
+  Choose one for this terminal with, for example:
+    export ANDROID_SERIAL=$(printf '%s\n' "$all" | head -n 1)"
+    fi
+    if [ -n "${ANDROID_SERIAL:-}" ]; then
+      die "the device chosen with ANDROID_SERIAL ($(show "$ANDROID_SERIAL")) is not reachable over ADB
+  (state: ${state:-none}).
+  Run: scripts/slate.sh connect <tv-ip>   and accept the prompt on the TV,
+  or choose another device: export ANDROID_SERIAL=<address>"
+    fi
+    die "no TV reachable over ADB (state: ${state:-none}).
   Run: scripts/slate.sh connect <tv-ip>   and accept the prompt on the TV.
   With several devices attached, set ANDROID_SERIAL to choose one."
+  fi
+  # With more than one device attached, say which one this is about: a command that went to
+  # another TV otherwise looks like a fault on the one that was meant.
+  if [ "$count" -gt 1 ] && [ "$TOLD_DEVICE" = 0 ]; then
+    TOLD_DEVICE=1
+    serial="$("$ADB" get-serialno 2>/dev/null || true)"
+    model="$(dev getprop ro.product.model 2>/dev/null || true)"
+    echo "Using $(show "$serial") ($(show "$model")); $count devices are attached and ANDROID_SERIAL chooses." >&2
+  fi
 }
 
 # Is the package installed, whether enabled or not?
@@ -1126,9 +1157,25 @@ case "$action" in
     out="$("$ADB" connect "$address" 2>&1 || true)"
     show "$out"
     case "$out" in
+      *"failed to authenticate"*)
+        die "the TV is asking whether to allow this computer. Choose Allow on the TV (and tick
+  \"Always allow from this computer\"), then run the same command again." ;;
       *"connected to"*) ;;
       *) die "could not connect. Check the address and that network debugging is on, then accept the prompt on the TV." ;;
     esac
+    # "already connected" is also what adb says about a TV that has not allowed this computer yet.
+    state="$("$ADB" -s "$address" get-state 2>/dev/null || true)"
+    [ "$state" = device ] || die "connected, but the TV has not allowed this computer yet (state: ${state:-none}).
+  Choose Allow on the TV, then run the same command again."
+    # The other commands go to whichever device ANDROID_SERIAL names, or to the only one attached.
+    if [ -n "${ANDROID_SERIAL:-}" ] && [ "$ANDROID_SERIAL" != "$address" ]; then
+      echo "Note: ANDROID_SERIAL is set to $(show "$ANDROID_SERIAL") in this terminal, so the other commands
+  go to that device and not to $address. To use this one:
+    export ANDROID_SERIAL=$address"
+    elif [ -z "${ANDROID_SERIAL:-}" ] && [ "$(attached | grep -c . || true)" -gt 1 ]; then
+      echo "Note: several devices are attached. To use this one for the other commands:
+    export ANDROID_SERIAL=$address"
+    fi
     ;;
 
   install)
@@ -1213,6 +1260,12 @@ case "$action" in
       fi
       die "lost contact with the TV. Nothing was changed."
     fi
+
+    wake="$(dev dumpsys power 2>/dev/null | LC_ALL=C tr -d '\r' | sed -n 's/^ *mWakefulness=//p' | head -n 1)"
+    case "$wake" in
+      Asleep|Dozing) die "the TV is asleep, so Slate cannot be shown and checked. Wake it with the remote
+  and run takeover again. Nothing was changed." ;;
+    esac
 
     echo "Checking that Slate starts and stays up..."
     uid="$(slate_uid)" || die "the TV did not say which user id Slate has, so it cannot be told whether Slate
