@@ -9,9 +9,15 @@ optional Continue watching row, and the screensaver's Picture of the Day from Wi
 
 ![Slate's home screen](docs/home.png)
 
+![The Continue watching row, with posters](docs/continue-watching.png)
+
 | Customise | Appearance | App options (hold OK) |
 |---|---|---|
 | ![The Customise panel](docs/customise.png) | ![Appearance settings](docs/appearance.png) | ![Options for one app](docs/app-options.png) |
+
+<sub>Posters in the second screenshot: *Sintel*, *Spring*, *Big Buck Bunny* and *Cosmos Laundromat*,
+© Blender Foundation (*Cosmos Laundromat*: Andy Goralczyk and the Blender Foundation), CC BY 3.0 / 4.0,
+via Wikimedia Commons. They come from the test app in `tools/test-apps/probe2`.</sub>
 
 ## Install
 
