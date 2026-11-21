@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Slate</string>
+    <string name="screensaver_label">Slate pictures</string>
+    <string name="guard_label">Slate Home button guard</string>
+    <string name="guard_description">Keeps Slate as the home screen: sends the Home button to Slate and returns to it whenever the stock home screen appears. It reads no screen content.</string>
+</resources>

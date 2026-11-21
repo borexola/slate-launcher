@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+    <!--
+        For the optional "continue watching" row, which is off until the user switches it on.
+        The first two let Slate read the TV's "watch next" list once the user (or ADB) allows
+        it. INTERNET is used for two things only, each off until the user switches it on: the
+        poster images that list points to, and the screensaver's Picture of the Day from
+        Wikimedia Commons. There are no ads, no analytics and nothing that phones home.
+    -->
+    <uses-permission android:name="android.permission.READ_TV_LISTINGS" />
+    <uses-permission android:name="com.android.providers.tv.permission.READ_EPG_DATA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <queries>
+        <!-- The apps to show. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- Other home screens, to report which one Android is using. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+        <!-- System screens Slate opens, so it can address the system's own handler directly. -->
+        <intent>
+            <action android:name="android.settings.SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.ACCESSIBILITY_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+            <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DELETE" />
+            <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:host="android.media.tv" android:scheme="content" />
+        </intent>
+        <!-- The TV's own list of what is being watched. -->
+        <provider android:authorities="android.media.tv" />
+    </queries>
+
+    <application
+        android:name=".SlateApp"
+        android:allowBackup="false"
+        android:banner="@drawable/banner"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Slate"
+        android:usesCleartextTraffic="false"
+        tools:targetApi="31">
+
+        <!--
+            taskAffinity is empty so that no other app can place an activity in the home screen's
+            task. No screenOrientation: a TV is always landscape, and forcing it would rotate
+            other kinds of display.
+        -->
+        <activity
+            android:name=".HomeActivity"
+            android:clearTaskOnLaunch="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|smallestScreenSize|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resumeWhilePausing="true"
+            android:stateNotNeeded="true"
+            android:taskAffinity=""
+            android:windowSoftInputMode="adjustNothing">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".system.HomeGuardService"
+            android:exported="true"
+            android:label="@string/guard_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/home_guard" />
+        </service>
+
+        <!--
+            The screensaver. Only the system can bind it (BIND_DREAM_SERVICE). It is chosen in the
+            TV's screensaver settings where those list it, or with scripts/slate.sh screensaver-on.
+        -->
+        <service
+            android:name=".system.ScreensaverService"
+            android:exported="true"
+            android:label="@string/screensaver_label"
+            android:permission="android.permission.BIND_DREAM_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.dreams.DreamService" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.dream"
+                android:resource="@xml/screensaver" />
+        </service>
+
+        <!--
+            A library Slate depends on would otherwise ask Google Play services for an emoji font
+            at start-up. Slate uses the network only for what the user switches on (posters, the
+            screensaver's picture of the day), so that is removed.
+        -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+                tools:node="remove" />
+        </provider>
+    </application>
+</manifest>

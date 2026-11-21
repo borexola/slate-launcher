@@ -1,0 +1,13 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+
+# Signing keys and anything describing one machine or one TV never go in the repository.
+*.jks
+*.keystore
+keystore.properties
+slate-config.json
+HANDOVER.md
