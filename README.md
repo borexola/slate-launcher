@@ -7,17 +7,25 @@ Slate uses the network for two things only, each off until you switch it on: pos
 optional Continue watching row, and the screensaver's Picture of the Day from Wikimedia Commons
 (see below).
 
-![Slate's home screen](docs/home.png)
+![Continue watching: the title in focus fills the background](docs/continue-watching.png)
 
-![The Continue watching row, with posters](docs/continue-watching.png)
+With Continue watching on, the title in focus fills the background, in a colour taken from its
+poster. Move down to the apps and your wallpaper is back.
+
+| | |
+|---|---|
+| ![A blue poster in focus](docs/featured-blue.png) | ![A green poster in focus](docs/featured-green.png) |
+
+![The apps, with the wallpaper behind them](docs/home.png)
 
 | Customise | Appearance | App options (hold OK) |
 |---|---|---|
 | ![The Customise panel](docs/customise.png) | ![Appearance settings](docs/appearance.png) | ![Options for one app](docs/app-options.png) |
 
-<sub>The film posters in the second screenshot belong to their respective owners and are shown only
+<sub>The film posters in these screenshots belong to their respective owners and are shown only
 to illustrate the row; they are not part of Slate. The entries were published by the test app in
-`tools/test-apps/probe2`, with poster images served by TMDB.</sub>
+`tools/test-apps/probe2`, with poster images served by TMDB. The apps screenshot was taken with
+that test app hidden, which also takes its entries out of Continue watching.</sub>
 
 ## Install
 
@@ -29,6 +37,9 @@ few minutes and need no build.
 - A computer on the same network as the TV, with `bash`, `git` and `curl` (Linux, macOS, or WSL
   on Windows).
 - `adb`, from the [Android platform-tools](https://developer.android.com/tools/releases/platform-tools).
+  Unpack the download in your home folder or in Downloads and the script finds it there; it
+  also finds Android Studio's copy and any `adb` already on your PATH. Kept somewhere else,
+  tell the script where: `export ADB=/path/to/platform-tools/adb`.
 
 **Steps**
 
@@ -213,6 +224,28 @@ on, and Android asks first whether Slate may read that list (or allow it from a 
   what any connection reveals (its address). JPEG and PNG posters are shown; for anything else
   the title is shown instead.
 - Nothing is read or fetched in safe mode, or while the row is switched off.
+- **Featured title** (Customise > Appearance, on by default): the entry in focus fills the
+  background with its poster, in a colour taken from it, with its title, episode and time left
+  ("34 min left · ends 21:57") above the row. Moving down to the apps brings the wallpaper back.
+  The bigger picture is made from the poster already fetched; nothing else is downloaded for it.
+
+### Top bar
+
+The time and date are at the left. Next to the buttons, small chips show free memory, the
+processor, free storage and the connection (Wi-Fi with its strength, Ethernet, or offline). Each
+can be switched off under Customise > Appearance. They are read every two seconds while the home
+screen is showing, and never sent anywhere. Since Android 8 apps may not see how busy the
+processor is; on such TVs the chip shows its current speed instead, and nothing where Android
+hides that too.
+
+### Screen care (OLED)
+
+OLED screens can keep a faint mark of a picture that stays put for hours, and a home screen is
+such a picture. With Customise > Appearance > Screen care on (the default), the home screen dims
+after 5 minutes without a key press, and every 3 minutes everything on it, the featured picture
+included, moves by a pixel or two round a small circle, too little to notice. The key press that
+wakes a dimmed screen only wakes it. For longer idle times, let the TV's screensaver take over
+(Slate's own, below, keeps changing pictures).
 
 ### Screensaver
 

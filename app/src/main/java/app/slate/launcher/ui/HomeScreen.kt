@@ -18,6 +18,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.ui.draw.drawBehind
+import app.slate.launcher.HomeActivity
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
@@ -46,7 +48,12 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.IntState
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +105,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Space between cards, in dp. Half of it sits inside each card's focus area. */
@@ -106,6 +114,17 @@ private const val GAP = 16
 /** How often a card asks for its picture, and how long it will wait for another go. */
 private const val POSTER_TRIES = 4
 private const val POSTER_RETRY_WITHIN_MS = 60_000L
+
+/**
+ * Screen care, for OLED screens, which wear unevenly under a picture that does not change: after
+ * this long without a key press the home screen dims, and every [ORBIT_STEP_MS] everything on it
+ * moves by a pixel or two, round a small circle ([ORBIT]).
+ */
+private const val IDLE_DIM_MS = 5 * 60_000L
+private const val IDLE_DIM = 0.75f
+private const val ORBIT_STEP_MS = 3 * 60_000L
+private const val ORBIT_REACH_DP = 3
+private val ORBIT = arrayOf(0 to 0, 2 to 0, 2 to 2, 0 to 2, -2 to 2, -2 to 0, -2 to -2, 0 to -2)
 
 /** After this many apps opened, the hint about holding OK has had its chance and goes. */
 private const val HINT_LAUNCHES = 5
@@ -132,6 +151,9 @@ private class ArtLoad(val art: AppArt?, val done: Boolean)
 
 /** What the home screen needs in order to address one card: give it focus, or scroll it into view. */
 private class CardHandle(val focus: FocusRequester, val bring: BringIntoViewRequester)
+
+/** Which part of the home screen has focus, as far as the picture behind it is concerned. */
+private enum class Zone { NONE, TOP, WATCH, APPS }
 
 /**
  * Scroll positions and focus bookkeeping for the home screen. Deliberately plain fields rather
@@ -200,6 +222,17 @@ private class HomeState {
         return handle.focus
     }
 
+    /**
+     * Where focus is, and the "continue watching" entry it was last on (by key). Observable,
+     * unlike the rest: the picture behind the home screen and the details above the row follow
+     * them. Only the small parts that show those read them, so a move costs little.
+     */
+    val zone = mutableStateOf(Zone.NONE)
+    val featuredKey = mutableStateOf<String?>(null)
+
+    /** Whether the featured entry's details are the list's first item (see SectionList). */
+    var heroShown = false
+
     /** True if focus arriving now is the direct result of a key press. */
     fun keyJustPressed() = SystemClock.uptimeMillis() - lastKeyAt < 300
 }
@@ -243,9 +276,10 @@ fun HomeScreen(vm: LauncherViewModel) {
         val watching = latestWatch.value
         if (target.sectionId == WATCH_SECTION) {
             val at = watching.indexOfFirst { it.key == target.pkg }
-            return if (at >= 0) 1 to at else null
+            // With the details above it, the list's very top is where the row is seen whole.
+            return if (at >= 0) (if (state.heroShown) 0 else 1) to at else null
         }
-        var item = if (watching.isEmpty()) 0 else 2
+        var item = if (watching.isEmpty()) 0 else if (state.heroShown) 3 else 2
         for (resolved in latestSections.value) {
             if (resolved.apps.isEmpty()) continue
             val section = resolved.section
@@ -522,9 +556,44 @@ fun HomeScreen(vm: LauncherViewModel) {
         }
     }
 
+    // Screen care (see IDLE_DIM_MS). When the user last did something here, whether the screen
+    // is dimmed, and the key whose press woke it (its release is not passed on either).
+    val care = appearance.screenCare
+    val activeAt = remember { longArrayOf(SystemClock.uptimeMillis()) }
+    var dimmed by remember { mutableStateOf(false) }
+    val waking = remember { intArrayOf(-1) }
+    val orbit = remember { mutableIntStateOf(0) }
+    val panelOpen = rememberUpdatedState(settingsOpen || inputsOpen || menu != null)
+    // Coming back to the home screen counts as doing something.
+    LaunchedEffect(tick) {
+        activeAt[0] = SystemClock.uptimeMillis()
+        dimmed = false
+    }
+    LaunchedEffect(care) {
+        if (!care) {
+            dimmed = false
+            orbit.intValue = 0
+            return@LaunchedEffect
+        }
+        var stepAt = SystemClock.uptimeMillis() + ORBIT_STEP_MS
+        while (true) {
+            delay(10_000)
+            val clock = SystemClock.uptimeMillis()
+            // A panel in use is the user at work, in a window of its own whose keys this does not see.
+            if (panelOpen.value || !HomeActivity.isShowing) activeAt[0] = clock
+            if (!dimmed && clock - activeAt[0] > IDLE_DIM_MS) dimmed = true
+            if (clock >= stepAt) {
+                orbit.intValue = (orbit.intValue + 1) % ORBIT.size
+                stepAt = clock + ORBIT_STEP_MS
+            }
+        }
+    }
+
     // Home pressed while already home: close everything and return to the top.
     LaunchedEffect(Unit) {
         vm.homeSignal.collectLatest {
+            activeAt[0] = SystemClock.uptimeMillis()
+            dimmed = false
             menu = null
             moving = null
             settingsOpen = false
@@ -550,13 +619,30 @@ fun HomeScreen(vm: LauncherViewModel) {
     CompositionLocalProvider(LocalAppearance provides appearance, LocalPalette provides palette) {
         Box(
             Modifier.fillMaxSize().onPreviewKeyEvent {
-                // Only notes that a key arrived; never consumes it.
+                // Notes that a key arrived. Consumes nothing, except the press that wakes a
+                // dimmed screen: that one only wakes it, and does not also open or move anything.
                 state.lastKeyAt = SystemClock.uptimeMillis()
-                false
+                activeAt[0] = state.lastKeyAt
+                val key = it.nativeKeyEvent
+                when {
+                    dimmed && key.action == KeyEvent.ACTION_DOWN -> {
+                        dimmed = false
+                        waking[0] = key.keyCode
+                        true
+                    }
+                    key.keyCode == waking[0] -> {
+                        if (key.action == KeyEvent.ACTION_UP) waking[0] = -1
+                        true
+                    }
+                    else -> false
+                }
             },
         ) {
-            Background(appearance, wallpaperVersion, safeMode)
-            Column(Modifier.fillMaxSize()) {
+            Box(Modifier.fillMaxSize().orbiting(orbit, behind = true)) {
+                Background(appearance, wallpaperVersion, safeMode)
+                FeaturedBehind(state, watch, appearance.featuredTitle)
+            }
+            Column(Modifier.fillMaxSize().orbiting(orbit)) {
                 TopBar(
                     state = state,
                     tick = tick,
@@ -610,11 +696,14 @@ fun HomeScreen(vm: LauncherViewModel) {
                 }
             }
             when {
-                moving != null -> Hint("Arrows to move  ·  OK or Back when done", Modifier.align(Alignment.BottomCenter))
+                moving != null -> Hint("Arrows to move  ·  OK or Back when done", Modifier.align(Alignment.BottomCenter).orbiting(orbit))
                 // Shown until it has been done once: nothing else on screen gives it away.
                 hasApps && !config.menuUsed && config.launchesSeen < HINT_LAUNCHES && menu == null && !settingsOpen && !inputsOpen ->
-                    Hint("Hold OK on an app for its options", Modifier.align(Alignment.BottomCenter))
+                    Hint("Hold OK on an app for its options", Modifier.align(Alignment.BottomCenter).orbiting(orbit))
             }
+            // Read only when drawn, so that fading does not rebuild the screen.
+            val dim by animateFloatAsState(if (dimmed && care) IDLE_DIM else 0f, tween(if (dimmed) 2_500 else 200), label = "idleDim")
+            Box(Modifier.fillMaxSize().drawBehind { if (dim > 0f) drawRect(Color.Black.copy(alpha = dim)) })
         }
 
         val menuTarget = menu
@@ -709,6 +798,38 @@ private fun rememberNow(tick: Int): LocalDateTime {
     return now
 }
 
+/**
+ * The picture of the featured "continue watching" entry behind the home screen: while focus is
+ * on that row, or above it with the row in view. Its own composable, so that focus moving about
+ * only redraws this.
+ */
+@Composable
+private fun FeaturedBehind(state: HomeState, watch: List<WatchItem>, on: Boolean) {
+    val atTop by remember { derivedStateOf { state.listState.firstVisibleItemIndex == 0 } }
+    val zone = state.zone.value
+    val featured = if (on) watch.firstOrNull { it.key == state.featuredKey.value } ?: watch.firstOrNull() else null
+    FeaturedBackdrop(featured, show = featured != null && (zone == Zone.WATCH || (zone != Zone.APPS && atTop)))
+}
+
+/** Where screen care has moved things to just now, in dp. */
+private fun orbitOffset(orbit: IntState): Pair<Int, Int> = ORBIT[orbit.intValue % ORBIT.size]
+
+/**
+ * Moves this by screen care's current offset. Read when drawn, so a step costs one redraw.
+ * Something [behind] everything fills the screen: it is enlarged by a little more than the
+ * offset, so that moving it never shows an edge.
+ */
+private fun Modifier.orbiting(orbit: IntState, behind: Boolean = false): Modifier = graphicsLayer {
+    val (x, y) = orbitOffset(orbit)
+    if (behind) {
+        val grow = 1f + 2 * ORBIT_REACH_DP.dp.toPx() / size.minDimension.coerceAtLeast(1f)
+        scaleX = grow
+        scaleY = grow
+    }
+    translationX = x.dp.toPx()
+    translationY = y.dp.toPx()
+}
+
 @Composable
 private fun TopBar(
     state: HomeState,
@@ -728,6 +849,7 @@ private fun TopBar(
     }
     val edge = appearance.edgePadding.coerceIn(Limits.edgePadding)
     val onPillFocus = {
+        state.zone.value = Zone.TOP
         state.focusedCard = null
         state.cardHasFocus = false
         // Only when the user went there; Android parking focus here by itself changes nothing.
@@ -743,23 +865,26 @@ private fun TopBar(
             .padding(top = 26.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (appearance.showDate) {
-            Label(now.format(dateFormat), size = 14f, color = palette.textDim)
+        // The time, and the date under it, at the left; status and buttons at the right.
+        Column {
+            if (appearance.showClock) {
+                Label(now.format(timeFormat), size = 26f, weight = FontWeight.Light)
+            }
+            if (appearance.showDate) {
+                Label(now.format(dateFormat), size = 12.5f, color = palette.textDim)
+            }
         }
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.width(16.dp))
+        // What room is left once the time and the buttons have theirs, the chips at its right.
+        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+            StatusChips(appearance.showMemory, appearance.showProcessor, appearance.showStorage, appearance.showNetwork)
+        }
+        Spacer(Modifier.width(14.dp))
         // Grouped so that Left and Right stay among the buttons instead of dropping into the cards.
         Row(Modifier.keepHorizontalFocus(), verticalAlignment = Alignment.CenterVertically) {
             if (showInputs) Pill("Inputs", onFocus = onPillFocus, onClick = onInputs)
             Pill("TV settings", onFocus = onPillFocus, onClick = onSystem)
             Pill("Customise", Modifier.focusRequester(state.customise), onFocus = onPillFocus, onClick = onCustomise)
-        }
-        if (appearance.showClock) {
-            Label(
-                text = now.format(timeFormat),
-                modifier = Modifier.padding(start = 10.dp, end = 14.dp),
-                size = 22f,
-                weight = FontWeight.Light,
-            )
         }
     }
 }
@@ -809,14 +934,19 @@ private fun SectionList(
     val iconStyle = appearance.cardStyle == CardStyle.ICON
     val rowCardWidth = (if (iconStyle) cardWidth * 0.62f else cardWidth.toFloat()) + GAP
 
-    val pivot = remember { PivotSpec(0.14f) }
+    // With the featured details above the "continue watching" row, focus on that row shows the
+    // list from its very top (see WatchCard): the usual scrolling to a fixed height stands aside.
+    val pivot = remember { PivotSpec(0.14f) { state.heroShown && state.zone.value == Zone.WATCH } }
+    val heroOn = appearance.featuredTitle && watch.isNotEmpty()
+    SideEffect { state.heroShown = heroOn }
+    val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.30f).dp
     val margin = remember(edge, density) { MarginSpec(with(density) { edge.dp.toPx() }) }
 
     // A lazy list keeps its first visible item in place when items are added above it. At the
     // very top that would hide a section which has just appeared (the first favourite, say), so
     // there the list is told to stay at the top instead.
     // (The "continue watching" row counts as well: it appears above everything else.)
-    val structure = (if (watch.isEmpty()) emptyList() else listOf(WATCH_SECTION to true)) +
+    val structure = (if (watch.isEmpty()) emptyList() else listOf(WATCH_SECTION to heroOn)) +
         visible.map { it.section.id to it.section.showTitle }
     // The row is taller than a row of apps, so that posters (which are narrow) stay legible.
     val watchHeight = cardWidth * 0.75f
@@ -824,8 +954,14 @@ private fun SectionList(
     val lastStructure = remember { arrayOf(structure) }
     if (lastStructure[0] != structure) {
         SideEffect {
+            val before = lastStructure[0]
             lastStructure[0] = structure
-            if (listState.firstVisibleItemIndex == 0) {
+            // Except when it is the "continue watching" row (or its details) that comes or goes
+            // above an app in focus: then the list keeps that app where it is, or it could be
+            // pushed below the screen's edge. The row is there to be seen on the way up.
+            val watchPart = { it: List<Pair<String, Boolean>> -> it.firstOrNull()?.takeIf { part -> part.first == WATCH_SECTION } }
+            val aroundApp = watchPart(before) != watchPart(structure) && state.zone.value == Zone.APPS && state.cardHasFocus
+            if (listState.firstVisibleItemIndex == 0 && !aroundApp) {
                 listState.requestScrollToItem(0, listState.firstVisibleItemScrollOffset)
             }
         }
@@ -838,8 +974,14 @@ private fun SectionList(
             contentPadding = PaddingValues(top = 4.dp, bottom = 72.dp),
         ) {
             if (watch.isNotEmpty()) {
-                // These two keys cannot collide with a section's: those all begin with
-                // "title:", "row:" or "grid:".
+                // These keys cannot collide with a section's: those all begin with "title:",
+                // "row:" or "grid:".
+                if (heroOn) {
+                    item(key = "watch:hero", contentType = "hero") {
+                        val featured = watch.firstOrNull { it.key == state.featuredKey.value } ?: watch.first()
+                        FeaturedDetails(featured, heroHeight, edgePadding, appearance.clock24h)
+                    }
+                }
                 item(key = "watch:title", contentType = "title") {
                     Label(
                         text = "CONTINUE WATCHING",
@@ -1075,6 +1217,7 @@ private fun AppCard(
             .onFocusChanged {
                 focused = it.isFocused
                 if (it.isFocused) {
+                    state.zone.value = Zone.APPS
                     state.focusedCard = target
                     state.cardHasFocus = true
                     state.rowFocus[target.sectionId] = target
@@ -1207,6 +1350,7 @@ private fun WatchCard(
     val palette = LocalPalette.current
     val repo = (LocalContext.current.applicationContext as SlateApp).watchNext
     val target = CardTarget(WATCH_SECTION, item.key)
+    val scope = rememberCoroutineScope()
 
     var focused by remember { mutableStateOf(false) }
     val url = item.posterUrl
@@ -1267,6 +1411,37 @@ private fun WatchCard(
             .onFocusChanged {
                 focused = it.isFocused
                 if (it.isFocused) {
+                    state.zone.value = Zone.WATCH
+                    state.featuredKey.value = item.key
+                    // The featured details sit above this row: show the list from its top, and then
+                    // make sure the row itself is whole on screen (a large text size can make the
+                    // details tall enough to push it down).
+                    val list = state.listState
+                    if (state.heroShown) {
+                        scope.launch {
+                            try {
+                                // A key already on its way may have moved focus on meanwhile.
+                                if (state.zone.value != Zone.WATCH) return@launch
+                                if (list.firstVisibleItemIndex != 0) {
+                                    if (appearance.animations) list.animateScrollToItem(0) else list.scrollToItem(0)
+                                }
+                                // Two frames: the details of this entry are composed in the first and
+                                // measured by the second, and their height decides where the row is.
+                                repeat(2) { withFrameNanos { } }
+                                if (state.zone.value != Zone.WATCH || list.firstVisibleItemIndex != 0) return@launch
+                                val info = list.layoutInfo
+                                val row = info.visibleItemsInfo.firstOrNull { it.key == "watch:row" } ?: return@launch
+                                // From the top, unless that would leave the row's lower edge off screen.
+                                val now = list.firstVisibleItemScrollOffset
+                                val wanted = (row.offset + now + row.size - info.viewportEndOffset).coerceAtLeast(0)
+                                if (wanted != now) {
+                                    if (appearance.animations) list.animateScrollToItem(0, wanted) else list.scrollToItem(0, wanted)
+                                }
+                            } catch (e: CancellationException) {
+                                // A newer scroll (the next key press) took over.
+                            }
+                        }
+                    }
                     state.focusedCard = target
                     state.cardHasFocus = true
                     state.rowFocus[target.sectionId] = target

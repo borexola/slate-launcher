@@ -74,6 +74,15 @@ data class Appearance(
     val clock24h: Boolean = true,
     val showDate: Boolean = true,
     val animations: Boolean = true,
+    /** The focused "continue watching" entry fills the background, with its details above the row. */
+    val featuredTitle: Boolean = true,
+    /** Status chips in the top bar. */
+    val showMemory: Boolean = true,
+    val showProcessor: Boolean = true,
+    val showStorage: Boolean = true,
+    val showNetwork: Boolean = true,
+    /** For OLED screens: dim when idle, and move everything a little now and then. */
+    val screenCare: Boolean = true,
 )
 
 @Serializable

@@ -19,6 +19,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -73,10 +74,21 @@ data class WatchItem(
     val intentUri: String,
     /** The app's name as it appears on the home screen. Filled in by the view model. */
     val appName: String = "",
+    /** How much is left to watch, in milliseconds, where the app says; at most [MAX_REMAINING_MS]. */
+    val remainingMs: Long? = null,
 )
+
+/** Longer than this left to watch is taken for a mistake, and not shown. */
+const val MAX_REMAINING_MS = 12 * 60 * 60_000L
 
 /** A decoded poster and what it weighs. */
 class Poster(val image: ImageBitmap, val bytes: Int)
+
+/**
+ * A picture to fill the screen behind the home screen while its entry has focus, with a dark
+ * colour taken from it for the parts of the screen the picture does not cover.
+ */
+class Backdrop(val image: ImageBitmap, val tint: Int, val bytes: Int)
 
 /**
  * Reads the TV's "watch next" list, fetches poster images for it, and opens its entries.
@@ -153,6 +165,18 @@ class WatchNextRepository(
     private val posters = object : LruCache<String, Poster>(POSTER_CACHE_KB) {
         // The address counts too: it can be long, and the picture behind it tiny.
         override fun sizeOf(key: String, value: Poster): Int = max(1, (value.bytes + key.length * 2) / 1024 + 1)
+    }
+
+    /**
+     * The cleaned bytes of posters fetched lately, so that a screen-sized picture of the entry in
+     * focus can be made without fetching it again. Nothing else is ever fetched for it.
+     */
+    private val cleaned = object : LruCache<String, Untrusted.CleanImage>(CLEANED_CACHE_KB) {
+        override fun sizeOf(key: String, value: Untrusted.CleanImage): Int = value.bytes.size / 1024 + 1
+    }
+
+    private val backdrops = object : LruCache<String, Backdrop>(BACKDROP_CACHE_KB) {
+        override fun sizeOf(key: String, value: Backdrop): Int = max(1, value.bytes / 1024 + 1)
     }
 
     /** One lock per app that has posters to fetch. Guarded by itself. */
@@ -277,6 +301,8 @@ class WatchNextRepository(
 
     fun dropPosters() {
         posters.evictAll()
+        cleaned.evictAll()
+        backdrops.evictAll()
         synchronized(failures) {
             failures.clear()
             unreached.clear()
@@ -658,6 +684,7 @@ class WatchNextRepository(
         val position = number(rows, columns.position)
         val duration = number(rows, columns.duration)
         val progress = if (duration > 0 && position in 1..duration) position.toFloat() / duration else null
+        val remaining = if (progress != null && duration - position in 1..MAX_REMAINING_MS) duration - position else null
 
         val address = sequenceOf(columns.poster, columns.thumbnail)
             .filter { it >= 0 && !rows.isNull(it) }
@@ -686,6 +713,7 @@ class WatchNextRepository(
             aspect = aspect,
             progress = progress,
             intentUri = intentUri,
+            remainingMs = remaining,
         )
     }
 
@@ -776,6 +804,7 @@ class WatchNextRepository(
                         // (Nothing in here suspends, so a card that scrolled away meanwhile cannot
                         // turn a download that was merely abandoned into a recorded failure.)
                         var retryAfter = RETRY_REFUSED_MS
+                        var image: Untrusted.CleanImage? = null
                         // runCatching also covers OutOfMemoryError: one bad image must not end the launcher.
                         val poster = runCatching {
                             val raw = try {
@@ -788,7 +817,9 @@ class WatchNextRepository(
                                 retryAfter = -1L
                                 null
                             }
-                            synchronized(decodeLock) { decode(raw) }
+                            image = raw?.let { Untrusted.cleanImage(it, MAX_POSTER_SIDE, MAX_POSTER_PIXELS, MAX_POSTER_BUFFERED) }
+                            val decoded = synchronized(decodeLock) { scaled(image, POSTER_HEIGHT, MAX_POSTER_WIDTH, MAX_DECODED_PIXELS) }
+                            decoded?.let { Poster(it.asImageBitmap(), it.byteCount) }
                         }.getOrNull()
                         // (Neither kept nor held against the address if the row was switched off
                         // under it: that is no answer either way.)
@@ -796,6 +827,8 @@ class WatchNextRepository(
                             // Nothing.
                         } else if (poster != null) {
                             posters.put(url, poster)
+                            // Kept for a larger picture while this entry has focus; see backdrop().
+                            image?.let { cleaned.put(url, it) }
                             synchronized(failures) { unreached.remove(failureKey(url, pkg)) }
                         } else {
                             val clock = SystemClock.elapsedRealtime()
@@ -831,40 +864,100 @@ class WatchNextRepository(
         false
     }
 
-    /** Cleans, decodes and scales the downloaded bytes to the size a card shows. */
-    private fun decode(raw: ByteArray?): Poster? {
-        raw ?: return null
-        val image = Untrusted.cleanImage(raw, MAX_POSTER_SIDE, MAX_POSTER_PIXELS, MAX_POSTER_BUFFERED) ?: return null
+    /**
+     * A picture to fill the screen with while the entry with the poster at [url] has focus, or
+     * null if there is none. Made from what was fetched for the poster, never fetched itself:
+     * larger where the cleaned picture is still at hand, else the poster as it is.
+     */
+    suspend fun backdrop(url: String): Backdrop? = withContext(Dispatchers.IO) {
+        backdrops.get(url)?.let { return@withContext it }
+        if (!enabled || !allowed()) return@withContext null
+        // runCatching also covers OutOfMemoryError: a picture that cannot be had is no backdrop,
+        // and a larger one that cannot be made leaves the poster as it is.
+        val large = runCatching {
+            cleaned.get(url)?.let { image ->
+                synchronized(decodeLock) { scaled(image, BACKDROP_HEIGHT, BACKDROP_MAX_WIDTH, BACKDROP_PIXELS) }
+            }
+        }.getOrNull()
+        val made = runCatching {
+            if (large != null) {
+                Backdrop(large.asImageBitmap(), tintOf(large), large.byteCount)
+            } else {
+                posters.get(url)?.let { Backdrop(it.image, tintOf(it.image.asAndroidBitmap()), it.bytes) }
+            }
+        }.getOrNull() ?: return@withContext null
+        // Only a larger picture is kept here. One made from the card's poster would hold on to
+        // that poster after the posters' own room has let it go, and costs little to make again.
+        if (large != null && enabled && allowed()) backdrops.put(url, made)
+        made
+    }
+
+    /**
+     * A dark colour that goes with [bitmap]: its most colourful part on average, darkened, for
+     * the screen around and behind the picture.
+     */
+    private fun tintOf(bitmap: Bitmap): Int {
+        val small = Bitmap.createScaledBitmap(bitmap, 16, 16, true)
+        var r = 0.0
+        var g = 0.0
+        var b = 0.0
+        var weights = 0.0
+        val hsv = FloatArray(3)
+        for (y in 0 until small.height) {
+            for (x in 0 until small.width) {
+                val pixel = small.getPixel(x, y)
+                android.graphics.Color.colorToHSV(pixel, hsv)
+                // Colourful, not too dark: what the eye takes for the picture's colour.
+                val weight = 0.05 + hsv[1] * hsv[2]
+                r += android.graphics.Color.red(pixel) * weight
+                g += android.graphics.Color.green(pixel) * weight
+                b += android.graphics.Color.blue(pixel) * weight
+                weights += weight
+            }
+        }
+        if (small !== bitmap) small.recycle()
+        val average = android.graphics.Color.rgb((r / weights).toInt(), (g / weights).toInt(), (b / weights).toInt())
+        android.graphics.Color.colorToHSV(average, hsv)
+        hsv[1] = min(hsv[1], 0.65f)
+        hsv[2] = 0.16f
+        return android.graphics.Color.HSVToColor(hsv)
+    }
+
+    /**
+     * [image] decoded and scaled to [height] pixels high, at most [maxWidth] wide, with no more
+     * than [maxPixels] decoded on the way. Null if it is null or cannot be decoded.
+     */
+    private fun scaled(image: Untrusted.CleanImage?, height: Int, maxWidth: Int, maxPixels: Long): Bitmap? {
+        image ?: return null
         val bytes = image.bytes
         // The size as it will be shown: orientations 5 to 8 turn the picture on its side.
         val turned = image.orientation in 5..8
-        val width = if (turned) image.height else image.width
-        val height = if (turned) image.width else image.height
+        val fullWidth = if (turned) image.height else image.width
+        val fullHeight = if (turned) image.width else image.height
 
         var sample = 1
-        while (height / (sample * 2) >= POSTER_HEIGHT) sample *= 2
+        while (fullHeight / (sample * 2) >= height) sample *= 2
         // A very wide image keeps its width large after sampling by height; bound the total too.
-        while ((width / sample).toLong() * (height / sample) > MAX_DECODED_PIXELS) sample *= 2
+        while ((fullWidth / sample).toLong() * (fullHeight / sample) > maxPixels) sample *= 2
 
         val options = BitmapFactory.Options().apply { inSampleSize = sample }
         val decoded = Untrusted.upright(
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null,
             image.orientation,
         )
-        val scale = minOf(1f, POSTER_HEIGHT.toFloat() / decoded.height, MAX_POSTER_WIDTH.toFloat() / decoded.width)
-        val out = if (scale < 1f) {
-            val scaled = Bitmap.createScaledBitmap(
+        val scale = minOf(1f, height.toFloat() / decoded.height, maxWidth.toFloat() / decoded.width)
+        return if (scale < 1f) {
+            val out = Bitmap.createScaledBitmap(
                 decoded,
                 (decoded.width * scale).roundToInt().coerceAtLeast(1),
                 (decoded.height * scale).roundToInt().coerceAtLeast(1),
                 true,
             )
-            if (scaled !== decoded) decoded.recycle()
-            scaled
+            if (out !== decoded) decoded.recycle()
+            out
         } else {
             decoded
         }
-        return Poster(out.asImageBitmap(), out.byteCount)
     }
 
     private companion object {
@@ -929,5 +1022,14 @@ class WatchNextRepository(
         const val MAX_POSTER_WIDTH = 1200
         /** Room for a full row of wide posters (about 1.1 MB each). */
         const val POSTER_CACHE_KB = 20 * 1024
+
+        /** The picture behind the home screen: about 720p, which the screen's darkening hides well. */
+        const val BACKDROP_HEIGHT = 720
+        const val BACKDROP_MAX_WIDTH = 1280
+        const val BACKDROP_PIXELS = 2_400_000L
+        /** Room for three such pictures. */
+        const val BACKDROP_CACHE_KB = 12 * 1024
+        /** Cleaned poster files kept for making them; a typical poster file is 100 to 500 KB. */
+        const val CLEANED_CACHE_KB = 8 * 1024
     }
 }

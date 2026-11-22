@@ -553,6 +553,33 @@ private fun LazyListScope.lookPage(
         vm.updateAppearance { it.copy(showClock = next != "Off", clock24h = next != "12-hour") }
     }
     toggle("Date", a.showDate) { vm.updateAppearance { it.copy(showDate = !it.showDate) } }
+    toggle(
+        title = "Featured title",
+        on = a.featuredTitle,
+        subtitle = "With Continue watching on: the entry in focus fills the background with its picture, " +
+            "with its title and time left above the row.",
+    ) { vm.updateAppearance { it.copy(featuredTitle = !it.featuredTitle) } }
+    toggle(
+        title = "Screen care",
+        on = a.screenCare,
+        subtitle = "For OLED screens, which can keep a faint mark of a picture that never changes: after 5 " +
+            "minutes without a key press the home screen dims, and every few minutes everything moves " +
+            "by a pixel or two. The key that wakes it does nothing else.",
+    ) { vm.updateAppearance { it.copy(screenCare = !it.screenCare) } }
+    toggle("Status: memory", a.showMemory, subtitle = "Free memory, in the top bar.") {
+        vm.updateAppearance { it.copy(showMemory = !it.showMemory) }
+    }
+    toggle(
+        title = "Status: processor",
+        on = a.showProcessor,
+        subtitle = "How busy the processor is. Where Android does not let apps see that, its speed; where neither, nothing.",
+    ) { vm.updateAppearance { it.copy(showProcessor = !it.showProcessor) } }
+    toggle("Status: storage", a.showStorage, subtitle = "Free storage on the TV.") {
+        vm.updateAppearance { it.copy(showStorage = !it.showStorage) }
+    }
+    toggle("Status: network", a.showNetwork, subtitle = "Wi-Fi with its strength, Ethernet, or offline.") {
+        vm.updateAppearance { it.copy(showNetwork = !it.showNetwork) }
+    }
     toggle("Animations", a.animations) { vm.updateAppearance { it.copy(animations = !it.animations) } }
 }
 

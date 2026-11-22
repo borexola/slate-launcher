@@ -86,11 +86,14 @@ fun Modifier.tvClickable(
 
 /**
  * Keeps the focused row at a fixed height on screen, so the list scrolls under a steady focus
- * instead of the focus wandering to the screen edge.
+ * instead of the focus wandering to the screen edge. While [standAside] says so, it leaves the
+ * list where it is.
  */
 @OptIn(ExperimentalFoundationApi::class)
-class PivotSpec(private val fraction: Float) : BringIntoViewSpec {
+class PivotSpec(private val fraction: Float, private val standAside: () -> Boolean = { false }) : BringIntoViewSpec {
     override fun calculateScrollDistance(offset: Float, size: Float, containerSize: Float): Float {
+        // Someone else is placing the list just now; see SectionList.
+        if (standAside()) return 0f
         val child = abs(size)
         val target = fraction * containerSize
         val lead = if (child <= containerSize && containerSize - target < child) containerSize - child else target

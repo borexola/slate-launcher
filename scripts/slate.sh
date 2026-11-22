@@ -19,7 +19,20 @@ SAVER_SHORT="$PKG/.system.ScreensaverService"
 SAVER_RECORD="/data/local/tmp/slate-screensaver-previous"
 # The largest photo Slate accepts (the same as for the wallpaper).
 MAX_PHOTO_BYTES=$((16 * 1024 * 1024))
-ADB=${ADB:-adb}
+# adb: ADB if set, else the one on PATH, else the usual places platform-tools ends up (Android
+# Studio's SDK, or Google's platform-tools zip unpacked in the home folder, Downloads or here).
+find_adb() {
+  local dir
+  if command -v adb >/dev/null 2>&1; then echo adb; return; fi
+  for dir in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Android/Sdk" "$HOME/Library/Android/sdk"; do
+    [ -n "$dir" ] && [ -x "$dir/platform-tools/adb" ] && { echo "$dir/platform-tools/adb"; return; }
+  done
+  for dir in "$HOME" "$HOME/Downloads" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; do
+    [ -x "$dir/platform-tools/adb" ] && { echo "$dir/platform-tools/adb"; return; }
+  done
+  echo adb
+}
+ADB=${ADB:-$(find_adb)}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Where released builds are published (for `update`). A fork can point this at its own.
 RELEASES="${SLATE_RELEASES:-https://github.com/borexola/slate-launcher/releases}"
@@ -148,13 +161,21 @@ dev_script() {
 
 # Prints the devices adb can use right now, one serial per line.
 attached() {
-  "$ADB" devices 2>/dev/null | LC_ALL=C tr -d '\r' |
+  { "$ADB" devices 2>/dev/null || true; } | LC_ALL=C tr -d '\r' |
     awk -F'\t' 'NR > 1 && $2 == "device" { print $1 }' | LC_ALL=C tr -cd '[:print:]\n'
 }
 
 TOLD_DEVICE=0
+need_adb() {
+  command -v "$ADB" >/dev/null 2>&1 || die "adb was not found. Download Android platform-tools:
+    https://developer.android.com/tools/releases/platform-tools
+  and unpack it in your home folder or Downloads (the script looks there), or tell the
+  script where adb is: export ADB=/path/to/platform-tools/adb"
+}
+
 require_device() {
   local state all count serial model
+  need_adb
   state="$("$ADB" get-state 2>/dev/null || true)"
   all="$(attached)"
   count="$(printf '%s\n' "$all" | grep -c . || true)"
@@ -1148,6 +1169,7 @@ case "$action" in
     ;;
 
   connect)
+    need_adb
     address="${2:-}"
     [ -n "$address" ] || die "usage: scripts/slate.sh connect <tv-ip>"
     case "$address" in
