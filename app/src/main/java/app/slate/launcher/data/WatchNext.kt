@@ -1,6 +1,7 @@
 package app.slate.launcher.data
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.ContentProviderClient
 import android.content.Context
 import android.content.Intent
@@ -12,6 +13,7 @@ import android.database.CursorWrapper
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
 import android.os.RemoteException
@@ -21,7 +23,10 @@ import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.IOException
+import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
@@ -31,6 +36,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -64,7 +70,10 @@ data class WatchItem(
     val title: String,
     /** Season and episode, where the app gives them. May be empty. */
     val episode: String,
-    /** Where the poster is, or null if there is none Slate would fetch. Always https. */
+    /**
+     * Where the poster is, or null if there is none Slate would fetch: an https address, or a
+     * content:// address of a picture the app itself hands out.
+     */
     val posterUrl: String?,
     /** The poster's width divided by its height, as the app declares it. */
     val aspect: Float,
@@ -111,6 +120,10 @@ class Backdrop(val image: ImageBitmap, val tint: Int, val bytes: Int)
  *    answer, from its first line on, is read under a fixed size, and the whole exchange under
  *    a fixed time after which the connection is cut. A server cannot keep a fetch open, nor
  *    make it hold more than those few megabytes.
+ *  - Some apps hand their pictures out themselves, with a content:// address (a media server's
+ *    app, whose pictures are on the home network, where Slate does not go). Such a picture is
+ *    read only from the very app that published the entry, never from another app's store on
+ *    its say-so, under the same size and a fixed time, one read at a time for each app.
  *  - What comes back goes through the same cleaning as any other image Slate did not make
  *    (see [Untrusted]) before the system decodes it.
  *  - Opening an entry never starts whatever the entry says. A new intent is built from the
@@ -183,7 +196,30 @@ class WatchNextRepository(
     private val appGates = HashMap<String, Mutex>()
 
     /** Fetches posters: any public https host, pictures only. See [SafeFetch]. */
-    private val fetcher = SafeFetch(scope, MAX_POSTER_BYTES, accept = "image/jpeg, image/png", maxLookups = MAX_LOOKUPS)
+    private val fetcher =
+        SafeFetch(scope, MAX_POSTER_BYTES, accept = "image/jpeg, image/png, image/webp", maxLookups = MAX_LOOKUPS)
+
+    /**
+     * How many pixels a poster may have that the decoder must hold whole, whatever size is asked
+     * of it (a progressive JPEG, a lossless WebP). Some apps give 4K pictures of that kind, which
+     * cost tens of megabytes for the moment they are decoded: taken where the TV has the memory.
+     */
+    private val maxBuffered: Long = runCatching {
+        val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memory = ActivityManager.MemoryInfo().also { manager.getMemoryInfo(it) }
+        if (!manager.isLowRamDevice && memory.totalMem >= ROOMY_BYTES) MAX_POSTER_BUFFERED_ROOMY else MAX_POSTER_BUFFERED
+    }.getOrDefault(MAX_POSTER_BUFFERED)
+
+    /**
+     * The threads on which apps' own pictures are read. As with the list, a question put to
+     * another app cannot be called back, so it is not put on a thread anything else waits on.
+     */
+    private val pictureReaders = ThreadPoolExecutor(0, MAX_OWN_READS, 30L, TimeUnit.SECONDS, SynchronousQueue()) { task ->
+        Thread(task, "slate-own-picture").apply { isDaemon = true }
+    }
+
+    /** Apps a read of whose picture is still out. Guarded by itself. */
+    private val readingOwn = HashSet<String>()
 
     /** Addresses that gave nothing usable, and until when (time since boot) not to ask again. */
     private val failures = HashMap<String, Long>()
@@ -689,10 +725,15 @@ class WatchNextRepository(
         val address = sequenceOf(columns.poster, columns.thumbnail)
             .filter { it >= 0 && !rows.isNull(it) }
             .map { rows.getString(it).orEmpty() }
-            .firstOrNull { it.length <= SafeFetch.MAX_URL_LENGTH && fetcher.checked(it) != null }
-        // See the class comment: no fetching on behalf of an app that may not use the network itself.
-        val mayFetch = address != null &&
-            pm.checkPermission(Manifest.permission.INTERNET, pkg) == PackageManager.PERMISSION_GRANTED
+            .firstOrNull {
+                it.length <= SafeFetch.MAX_URL_LENGTH && (fetcher.checked(it) != null || ownPicture(it, pkg) != null)
+            }
+        // See the class comment: no fetching on behalf of an app that may not use the network
+        // itself. A picture the app hands out itself is not fetched from anywhere.
+        val mayFetch = address != null && (
+            address.startsWith(OWN_SCHEME) ||
+                pm.checkPermission(Manifest.permission.INTERNET, pkg) == PackageManager.PERMISSION_GRANTED
+            )
 
         val aspect = when (if (columns.aspect < 0 || rows.isNull(columns.aspect)) -1 else rows.getInt(columns.aspect)) {
             1 -> 3f / 2f
@@ -765,6 +806,84 @@ class WatchNextRepository(
 
     // ---- posters ----
 
+    /**
+     * [address] as a picture that app [pkg] hands out itself, or null: a content:// address
+     * that belongs to that very app and is open to other apps. Anything else of that kind is
+     * left alone: an app does not get to have Slate read another app's store.
+     */
+    private fun ownPicture(address: String, pkg: String): Uri? {
+        if (!address.startsWith(OWN_SCHEME) || address.any { it.code !in 0x21..0x7E }) return null
+        val uri = runCatching { Uri.parse(address) }.getOrNull() ?: return null
+        // (No "user@": that names another user's copy of the store.)
+        val authority = uri.encodedAuthority?.takeIf { it.isNotEmpty() && '@' !in it } ?: return null
+        val provider = runCatching { pm.resolveContentProvider(authority, 0) }.getOrNull() ?: return null
+        return if (provider.packageName == pkg && provider.exported && provider.enabled) uri else null
+    }
+
+    /**
+     * The bytes of the picture app [pkg] hands out at [address], or null if it gives nothing
+     * usable. Throws [IOException] where another go soon is worth it: the app did not answer
+     * in time, or a read of its earlier picture is still out.
+     *
+     * Call off the main thread: this blocks for up to [OWN_READ_TIME_MS].
+     */
+    private fun readOwn(address: String, pkg: String): ByteArray? {
+        // Asked again, not remembered from when the list was read: the app may have changed since.
+        val uri = ownPicture(address, pkg) ?: return null
+        if (!synchronized(readingOwn) { readingOwn.add(pkg) }) throw IOException("an earlier read is still running")
+        val signal = CancellationSignal()
+        val open = AtomicReference<Closeable?>()
+        val task = try {
+            pictureReaders.submit(
+                Callable {
+                    try {
+                        // A client of its own, which does not tie Slate's fate to the app's process.
+                        val client = context.contentResolver.acquireUnstableContentProviderClient(uri) ?: return@Callable null
+                        try {
+                            client.openAssetFile(uri, "r", signal)?.use { file ->
+                                file.createInputStream().use { input ->
+                                    open.set(input)
+                                    val out = ByteArrayOutputStream(64 * 1024)
+                                    val buffer = ByteArray(16 * 1024)
+                                    while (true) {
+                                        val read = input.read(buffer)
+                                        if (read < 0) break
+                                        // Too large is no picture, however much more there is.
+                                        if (out.size() + read > MAX_POSTER_BYTES) return@Callable null
+                                        out.write(buffer, 0, read)
+                                    }
+                                    out.toByteArray()
+                                }
+                            }
+                        } finally {
+                            runCatching { client.close() }
+                        }
+                    } finally {
+                        synchronized(readingOwn) { readingOwn -= pkg }
+                    }
+                },
+            )
+        } catch (e: Throwable) {
+            // Every reader is out, or no thread could be started.
+            synchronized(readingOwn) { readingOwn -= pkg }
+            throw IOException("no reader to be had")
+        }
+        return try {
+            task.get(OWN_READ_TIME_MS, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            // The app is asked to stop, and what it handed over is closed, which ends a read
+            // that is waiting on it. An app that takes no notice keeps its one reader until it
+            // lets go, and gets no other meanwhile.
+            runCatching { signal.cancel() }
+            runCatching { open.get()?.close() }
+            task.cancel(true)
+            throw IOException("not read in time")
+        } catch (e: Exception) {
+            // The app refused, or failed: it has no picture to show.
+            null
+        }
+    }
+
     fun cachedPoster(url: String): Poster? = posters.get(url)
 
     /**
@@ -808,7 +927,11 @@ class WatchNextRepository(
                         // runCatching also covers OutOfMemoryError: one bad image must not end the launcher.
                         val poster = runCatching {
                             val raw = try {
-                                fetcher.download(url, pkg, active = { enabled && allowed() })
+                                if (url.startsWith(OWN_SCHEME)) {
+                                    readOwn(url, pkg)
+                                } else {
+                                    fetcher.download(url, pkg, active = { enabled && allowed() })
+                                }
                             } catch (e: SafeFetch.Refused) {
                                 null
                             } catch (e: IOException) {
@@ -817,7 +940,9 @@ class WatchNextRepository(
                                 retryAfter = -1L
                                 null
                             }
-                            image = raw?.let { Untrusted.cleanImage(it, MAX_POSTER_SIDE, MAX_POSTER_PIXELS, MAX_POSTER_BUFFERED) }
+                            image = raw?.let {
+                                Untrusted.cleanImage(it, MAX_POSTER_SIDE, MAX_POSTER_PIXELS, maxBuffered, webp = true)
+                            }
                             val decoded = synchronized(decodeLock) { scaled(image, POSTER_HEIGHT, MAX_POSTER_WIDTH, MAX_DECODED_PIXELS) }
                             decoded?.let { Poster(it.asImageBitmap(), it.byteCount) }
                         }.getOrNull()
@@ -1015,6 +1140,21 @@ class WatchNextRepository(
         const val MAX_POSTER_SIDE = 4096
         const val MAX_POSTER_PIXELS = 9_000_000L
         const val MAX_POSTER_BUFFERED = 2_500_000L
+        /** With memory to spare: a 4K picture (3840 x 2160). */
+        const val MAX_POSTER_BUFFERED_ROOMY = 8_300_000L
+        /**
+         * What counts as memory to spare. Decoding such a picture takes 25 to 50 MB for a moment,
+         * one picture at a time. A TV sold as having 1.5 GB reports a little under that and has
+         * it to give; one with 1 GB is left out.
+         */
+        const val ROOMY_BYTES = 1_200L * 1024 * 1024
+
+        /** How a picture an app hands out itself is addressed. */
+        const val OWN_SCHEME = "content://"
+        /** How long an app has to hand over a picture of its own. */
+        const val OWN_READ_TIME_MS = 10_000L
+        /** Reads of apps' own pictures out at once, one for each app at most. */
+        const val MAX_OWN_READS = 6
         const val MAX_DECODED_PIXELS = 1_500_000L
 
         /** Posters are kept at this height in pixels: a card on a 1080p screen, zoomed by focus. */

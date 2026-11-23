@@ -5,6 +5,8 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <application android:label="Good Films">
+        <!-- Pictures the app hands out itself, as a media server's app does. See ImageProvider. -->
+        <provider android:name=".ImageProvider" android:authorities="app.slate.probe2.images" android:exported="true" />
         <activity android:name=".PublishActivity" android:exported="true" />
         <activity android:name=".PlayActivity" android:exported="true">
             <intent-filter>

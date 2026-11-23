@@ -70,16 +70,23 @@ internal object Untrusted {
 
     /**
      * Turns untrusted image bytes into a [CleanImage], or returns null if they are not a plain
-     * JPEG or PNG within the limits.
+     * JPEG or PNG within the limits. With [webp], a still WebP picture is taken too.
      *
      * [maxBufferedPixels] is the tighter limit for images the decoder must hold whole. It is
      * stated for an ordinary three-channel picture; one with four channels needs a third more
      * memory per pixel, so it is allowed correspondingly fewer.
      */
-    fun cleanImage(raw: ByteArray, maxSide: Int, maxPixels: Long, maxBufferedPixels: Long): CleanImage? = try {
+    fun cleanImage(
+        raw: ByteArray,
+        maxSide: Int,
+        maxPixels: Long,
+        maxBufferedPixels: Long,
+        webp: Boolean = false,
+    ): CleanImage? = try {
         val clean = when {
             isPng(raw) -> cleanPng(raw)
             isJpeg(raw) -> cleanJpeg(raw)
+            webp && isWebp(raw) -> cleanWebp(raw)
             else -> null
         }
         when {
@@ -89,7 +96,7 @@ internal object Untrusted {
             clean.width.toLong() * clean.height > maxPixels -> null
             clean.buffered && clean.width.toLong() * clean.height * clean.channels > maxBufferedPixels * 3 -> null
             // Last, let the system read the cleaned header and confirm it sees the same picture.
-            !agreesWithSystem(clean) -> null
+            !agreesWithSystem(clean, webp) -> null
             else -> clean
         }
     } catch (e: Exception) {
@@ -98,10 +105,11 @@ internal object Untrusted {
         null
     }
 
-    private fun agreesWithSystem(image: CleanImage): Boolean {
+    private fun agreesWithSystem(image: CleanImage, webp: Boolean): Boolean {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(image.bytes, 0, image.bytes.size, options)
-        return (options.outMimeType == "image/jpeg" || options.outMimeType == "image/png") &&
+        val type = options.outMimeType
+        return (type == "image/jpeg" || type == "image/png" || (webp && type == "image/webp")) &&
             options.outWidth == image.width && options.outHeight == image.height
     }
 
@@ -379,6 +387,124 @@ internal object Untrusted {
             }
         }
         return 1
+    }
+
+    // ---- WebP ----
+
+    private fun tag(raw: ByteArray, at: Int, text: String) =
+        at + text.length <= raw.size && text.indices.all { raw[at + it] == text[it].code.toByte() }
+
+    private fun isWebp(raw: ByteArray) = raw.size > 20 && tag(raw, 0, "RIFF") && tag(raw, 8, "WEBP")
+
+    /** A 4-byte length as WebP writes it (lowest byte first), or -1 if it is too large to be one. */
+    private fun little32(raw: ByteArray, at: Int): Int {
+        val value = unsigned(raw, at) or (unsigned(raw, at + 1) shl 8) or (unsigned(raw, at + 2) shl 16) or
+            (unsigned(raw, at + 3) shl 24)
+        return if (value < 0) -1 else value
+    }
+
+    private fun little24(raw: ByteArray, at: Int): Int =
+        unsigned(raw, at) or (unsigned(raw, at + 1) shl 8) or (unsigned(raw, at + 2) shl 16)
+
+    private fun writeChunk(out: ByteArrayOutputStream, type: String, raw: ByteArray, start: Int, length: Int) {
+        out.write(type.toByteArray(Charsets.ISO_8859_1))
+        for (shift in 0..24 step 8) out.write(length ushr shift and 0xFF)
+        out.write(raw, start, length)
+        // Chunks are padded to an even length.
+        if (length and 1 == 1) out.write(0)
+    }
+
+    /**
+     * Rebuilds a still WebP picture from its picture data alone: one lossy frame, with its
+     * transparency if it has any, or one lossless frame. Animations are refused. Colour profiles,
+     * Exif, XMP and every part not known are dropped, and so is whatever follows the picture.
+     */
+    private fun cleanWebp(raw: ByteArray): CleanImage? {
+        // "RIFF", the length of all that follows, "WEBP", then chunks: 4-byte type, 4-byte length, data.
+        val declared = little32(raw, 4)
+        if (declared < 4 || declared > raw.size - 8) return null
+        val end = 8 + declared
+        var position = 12
+        var extended = false
+        var canvasWidth = 0
+        var canvasHeight = 0
+        var alphaStart = -1
+        var alphaLength = 0
+        while (true) {
+            if (position + 8 > end) return null
+            val length = little32(raw, position + 4)
+            val data = position + 8
+            if (length < 0 || length > end - data) return null
+            when {
+                tag(raw, position, "VP8X") -> {
+                    // Only as the first chunk: flags, 3 unused bytes, the picture's size less one.
+                    if (position != 12 || length != 10) return null
+                    // An animation is not one picture.
+                    if (unsigned(raw, data) and 0x02 != 0) return null
+                    canvasWidth = little24(raw, data + 4) + 1
+                    canvasHeight = little24(raw, data + 7) + 1
+                    extended = true
+                }
+                tag(raw, position, "ALPH") -> {
+                    // Transparency for the lossy frame that follows: once, and not empty.
+                    if (!extended || alphaStart >= 0 || length < 1) return null
+                    alphaStart = data
+                    alphaLength = length
+                }
+                tag(raw, position, "VP8 ") -> {
+                    if (!extended && position != 12) return null
+                    // A key frame: 3 bytes of frame tag, a start code, then 14 bits each of width and height.
+                    if (length < 10 || unsigned(raw, data) and 1 != 0) return null
+                    if (unsigned(raw, data + 3) != 0x9D || unsigned(raw, data + 4) != 0x01 || unsigned(raw, data + 5) != 0x2A) return null
+                    val width = (unsigned(raw, data + 6) or (unsigned(raw, data + 7) shl 8)) and 0x3FFF
+                    val height = (unsigned(raw, data + 8) or (unsigned(raw, data + 9) shl 8)) and 0x3FFF
+                    if (extended && (width != canvasWidth || height != canvasHeight)) return null
+                    val body = ByteArrayOutputStream(length + alphaLength + 64)
+                    if (alphaStart >= 0) {
+                        // The extended form, saying only that there is transparency.
+                        val header = ByteArray(10)
+                        header[0] = 0x10
+                        for (i in 0..2) {
+                            header[4 + i] = (width - 1 ushr (8 * i)).toByte()
+                            header[7 + i] = (height - 1 ushr (8 * i)).toByte()
+                        }
+                        writeChunk(body, "VP8X", header, 0, header.size)
+                        writeChunk(body, "ALPH", raw, alphaStart, alphaLength)
+                    }
+                    writeChunk(body, "VP8 ", raw, data, length)
+                    // The transparency is held whole while the picture is decoded: one more channel's worth.
+                    return CleanImage(riff(body), width, height, buffered = alphaStart >= 0, channels = 1)
+                }
+                tag(raw, position, "VP8L") -> {
+                    if ((!extended && position != 12) || alphaStart >= 0) return null
+                    // A signature byte, then 14 bits each of width and height less one, a flag, 3 bits of version.
+                    if (length < 5 || unsigned(raw, data) != 0x2F) return null
+                    val bits = unsigned(raw, data + 1).toLong() or (unsigned(raw, data + 2).toLong() shl 8) or
+                        (unsigned(raw, data + 3).toLong() shl 16) or (unsigned(raw, data + 4).toLong() shl 24)
+                    val width = (bits and 0x3FFF).toInt() + 1
+                    val height = (bits shr 14 and 0x3FFF).toInt() + 1
+                    if (bits shr 29 and 7 != 0L) return null
+                    if (extended && (width != canvasWidth || height != canvasHeight)) return null
+                    val body = ByteArrayOutputStream(length + 16)
+                    writeChunk(body, "VP8L", raw, data, length)
+                    // A lossless picture is decoded whole, with four channels, whatever size is asked for.
+                    return CleanImage(riff(body), width, height, buffered = true, channels = 4)
+                }
+                tag(raw, position, "ANIM") || tag(raw, position, "ANMF") -> return null
+                else -> Unit
+            }
+            position = data + length + (length and 1)
+        }
+    }
+
+    private fun riff(body: ByteArrayOutputStream): ByteArray {
+        val out = ByteArrayOutputStream(body.size() + 12)
+        out.write("RIFF".toByteArray(Charsets.ISO_8859_1))
+        val length = body.size() + 4
+        for (shift in 0..24 step 8) out.write(length ushr shift and 0xFF)
+        out.write("WEBP".toByteArray(Charsets.ISO_8859_1))
+        body.writeTo(out)
+        return out.toByteArray()
     }
 
     private fun unsigned(raw: ByteArray, at: Int) = raw[at].toInt() and 0xFF

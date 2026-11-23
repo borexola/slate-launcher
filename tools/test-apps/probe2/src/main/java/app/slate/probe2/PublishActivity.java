@@ -14,6 +14,7 @@ import android.util.Log;
  *
  * Mode "demo" with a "list" extra publishes that list instead, most recent first:
  * `--es list "Title|https://host/poster.jpg;Another title|https://host/other.jpg"`.
+ * An address may also be one of the app's own pictures: see ImageProvider.
  */
 public class PublishActivity extends Activity {
     private static final Uri LIST = Uri.parse("content://android.media.tv/watch_next_program");

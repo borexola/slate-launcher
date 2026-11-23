@@ -221,8 +221,11 @@ on, and Android asks first whether Slate may read that list (or allow it from a 
   never something else the entry might ask for.
 - Poster images are fetched from the addresses the apps give, over https only, and only for apps
   that may use the network themselves. The request carries nothing about you or the TV beyond
-  what any connection reveals (its address). JPEG and PNG posters are shown; for anything else
-  the title is shown instead.
+  what any connection reveals (its address). JPEG, PNG and still WebP posters are shown, up to
+  4K; for anything else the title is shown instead.
+- Some apps hand out their posters themselves instead of giving a web address (Jellyfin, whose
+  pictures are on your own server). Slate reads those from that app, and only from the app that
+  reported the entry. Posters at a plain address on the home network are not fetched.
 - Nothing is read or fetched in safe mode, or while the row is switched off.
 - **Featured title** (Customise > Appearance, on by default): the entry in focus fills the
   background with its poster, in a colour taken from it, with its title, episode and time left
